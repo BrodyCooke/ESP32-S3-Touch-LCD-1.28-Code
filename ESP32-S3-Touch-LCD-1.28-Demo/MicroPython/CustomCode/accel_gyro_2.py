@@ -48,10 +48,11 @@ class QMI8658:
         self.calib = None
         self.gyro_cal = None
         self.mps_threshhold = .2 #tune the mps threshold, used for determining if stationary
-        self.sample_rate = 1/200  # 50 Hz loop rate
+        self.sample_rate = 1/50  # 50 Hz loop rate
         self.beta= .1 #Tune beta: smaller (e.g. 0.05) = smoother but slower(trust gyro more), larger = faster but noisier(trust accel).
-        self.alpha = .995  # tweak between 0.9-0.99 This is the leak for vel
+        self.alpha = .995  # tweak between 0.9-0.99
         self.spin_cuttof = 1200  # deg/s threshold — tune for your disc
+        self.trust_gyro_threshold = 10 #basically never trust the gyro
         self.vel = [0,0,0]
         self.pos = [0,0,0]
         self.time = 0
@@ -220,25 +221,52 @@ class QMI8658:
         vx,vy,vz = self.vel
         px,py,pz = self.pos
         
+        # check the magnitude of accel and adjust magwitch beta as needed
+        mag = math.sqrt(ax*ax + ay*ay + az*az)
+        if abs(mag - 1.0) > self.trust_gyro_threshold:  # if not close to 1 g
+            ahrs.update_beta(0.01)  # trust gyro more
+            print("TRUST GYRO")
+        else:
+            ahrs.update_beta(self.beta)   # normal correction
+        
+        
         # --- Update Madgwick filter ---
         ahrs.update_imu(math.radians(gx), math.radians(gy), math.radians(gz),
                         ax, ay, az)
-
+        q = ahrs.quaternion
         # --- Get gravity vector in body frame ---
-        gx_g, gy_g, gz_g = gravity_from_quaternion(ahrs.quaternion)
+        gx_g, gy_g, gz_g = gravity_from_quaternion(q)
+        
+         # --- Remove gravity from measured acceleration ---
+        ax_lin_b  = (ax - gx_g) * ONE_G
+        ay_lin_b = (ay - gy_g) * ONE_G
+        az_lin_b = (az - gz_g) * ONE_G
+        
+        # 3) rotate linear accel into world frame
+        # a_world = R * a_body  (we use quaternion rotate)
+        ax_w, ay_w, az_w = quat_rotate_vec((ax_lin_b, ay_lin_b, az_lin_b), q)
 
-        # --- Remove gravity from measured acceleration ---
-        ax_lin = (ax - gx_g) * ONE_G
-        ay_lin = (ay - gy_g) * ONE_G
-        az_lin = (az - gz_g) * ONE_G
+        # 4) optional: discard accel integration while spinning too fast
+        spin = math.sqrt(gx*gx + gy*gy + gz*gz)
+        if spin > self.spin_cuttof:  # deg/s threshold — tune for your disc
+            # skip or attenuate integration for this sample
+            pass
+        else:
+            # integrate to velocity (world frame)
+            vx += ax_w * dt
+            vy += ay_w * dt
+            vz += az_w * dt
+    
+        # 5) leakage and ZUPT (stationary detection) to limit drift
+        leak = self.alpha
+        vx *= leak; vy *= leak; vz *= leak
 
-        # --- Integrate acceleration to velocity ---
-        vx += ax_lin * dt
-        vy += ay_lin * dt
-        vz += az_lin * dt
-
-        if (abs(ax_lin) < self.mps_threshhold and abs(ay_lin) < self.mps_threshhold and abs(az_lin) < self.mps_threshhold):
+        
+        # --- Zero-velocity detection ---
+        if (abs(ax_w) < self.mps_threshhold and abs(ay_w) < self.mps_threshhold and abs(az_w) < self.mps_threshhold):
             vx = vy = vz = 0
+        
+
 
         # Integrate velocity to get position (s = s0 + vt)
         px += vx * dt
@@ -451,8 +479,8 @@ if __name__ == "__main__":
         vel = qmi8658.vel
         pos = qmi8658.pos
         if (counter % 10) == 0:
-            #print("Velocity:",round(vel[0],3),round(vel[1],3),round(vel[2],3))
-            print("Possition:",round(pos[0],3),round(pos[1],3),round(pos[2],3))
+            #print("Velocity:",round(vel[0],1),round(vel[1],1),round(vel[2],1))
+            print("Possition:",round(pos[0],1),round(pos[1],1),round(pos[2],1))
             tft.fill(0)
             tft.text(font,f'POS X:{round(pos[0],3)}',int(col_max/3),int(row_max/5)*2)
             tft.text(font,f'POS Y:{round(pos[1],3)}',int(col_max/3),int(row_max/5)*3)
@@ -460,5 +488,6 @@ if __name__ == "__main__":
         counter=counter+1
         time.sleep(sample_period)
         
+
 
 
