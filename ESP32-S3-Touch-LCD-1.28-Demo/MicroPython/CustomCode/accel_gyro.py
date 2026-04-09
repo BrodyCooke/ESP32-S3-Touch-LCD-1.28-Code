@@ -48,10 +48,13 @@ class QMI8658:
         self.calib = None
         self.gyro_cal = None
         self.mps_threshhold = .2 #tune the mps threshold, used for determining if stationary
-        self.sample_rate = 1/200  # 50 Hz loop rate
+        self.sample_rate = 1/250  # 50 Hz loop rate
         self.beta= .1 #Tune beta: smaller (e.g. 0.05) = smoother but slower(trust gyro more), larger = faster but noisier(trust accel).
-        self.alpha = .995  # tweak between 0.9-0.99 This is the leak for vel
+        self.alpha = .995  # tweak between 0.9-0.99
         self.spin_cuttof = 1200  # deg/s threshold — tune for your disc
+        self.trust_gyro_threshold = 10 #basically never trust the gyro
+        self.acc = [0,0,0]
+        self.dt = 0
         self.vel = [0,0,0]
         self.pos = [0,0,0]
         self.time = 0
@@ -165,18 +168,13 @@ class QMI8658:
         raw_acc_y = twos_complement_16bit(raw_acc_y)
         raw_acc_z = twos_complement_16bit(raw_acc_z)
         
-        acc_x = (raw_acc_x * ONE_G) / acc_lsb_div
-        acc_y = (raw_acc_y * ONE_G) / acc_lsb_div
-        acc_z = (raw_acc_z * ONE_G) / acc_lsb_div
+        acc_x = (raw_acc_x) / acc_lsb_div
+        acc_y = (raw_acc_y) / acc_lsb_div
+        acc_z = (raw_acc_z) / acc_lsb_div
 
         #print("Acceleration:", acc_x, acc_y, acc_z)
         return acc_x, acc_y, acc_z
     
-    
-    def read_acc_g(self):
-        acc = self.read_acc()
-        acc_g = [x / ONE_G for x in acc]
-        return(acc_g)
           
         
     def read_gyro(self):
@@ -205,47 +203,86 @@ class QMI8658:
     
     
     def update_motion(self):     
-        acc_g = qmi8658.read_acc_g()
-        gyro = qmi8658.read_gyro()
-        acc_g = qmi8658.correct_accel(acc_g)
-        gyro = qmi8658.correct_gyro(gyro)
+        acc = qmi8658.read_acc()
+        #gyro = qmi8658.read_gyro()
+        acc = qmi8658.correct_accel(acc)
+        #gyro = qmi8658.correct_gyro(gyro)
         
         # Get current time and compute time difference
         current_time = time.ticks_ms()
         dt = (time.ticks_diff(current_time, self.time)) / 1000.0  # Convert to seconds
         self.time = current_time  # Update last time
+        self.dt = dt
         
-        ax, ay, az = (acc_g[0],acc_g[1],acc_g[2])
-        gx, gy, gz = (gyro[0],gyro[1],gyro[2])
+        acc_mps = [x * ONE_G for x in acc]
+        ax_b, ay_b, az_b = (acc_mps[0],acc_mps[1],acc_mps[2]+ONE_G)
+ 
+        self.acc = [ax_b,ay_b,az_b]
+        #gx, gy, gz = (gyro[0],gyro[1],gyro[2])
         vx,vy,vz = self.vel
         px,py,pz = self.pos
+        
+        vx += ax_b * dt
+        vy += ay_b * dt
+        vz += az_b * dt
+        
+        px += vx * dt
+        py += vy * dt
+        pz += vz * dt
+        '''
+        # check the magnitude of accel and adjust magwitch beta as needed
+        mag = math.sqrt(ax*ax + ay*ay + az*az)
+        if abs(mag - 1.0) > self.trust_gyro_threshold:  # if not close to 1 g
+            ahrs.update_beta(0.01)  # trust gyro more
+            print("TRUST GYRO")
+        else:
+            ahrs.update_beta(self.beta)   # normal correction
+        
         
         # --- Update Madgwick filter ---
         ahrs.update_imu(math.radians(gx), math.radians(gy), math.radians(gz),
                         ax, ay, az)
-
+        q = ahrs.quaternion
         # --- Get gravity vector in body frame ---
-        gx_g, gy_g, gz_g = gravity_from_quaternion(ahrs.quaternion)
+        gx_g, gy_g, gz_g = gravity_from_quaternion(q)
+        
+         # --- Remove gravity from measured acceleration ---
+        ax_lin_b  = (ax - gx_g) * ONE_G
+        ay_lin_b = (ay - gy_g) * ONE_G
+        az_lin_b = (az - gz_g) * ONE_G
+        
+        # 3) rotate linear accel into world frame
+        # a_world = R * a_body  (we use quaternion rotate)
+        ax_w, ay_w, az_w = quat_rotate_vec((ax_lin_b, ay_lin_b, az_lin_b), q)
 
-        # --- Remove gravity from measured acceleration ---
-        ax_lin = (ax - gx_g) * ONE_G
-        ay_lin = (ay - gy_g) * ONE_G
-        az_lin = (az - gz_g) * ONE_G
+        # 4) optional: discard accel integration while spinning too fast
+        spin = math.sqrt(gx*gx + gy*gy + gz*gz)
+        if spin > self.spin_cuttof:  # deg/s threshold — tune for your disc
+            # skip or attenuate integration for this sample
+            pass
+        else:
+            # integrate to velocity (world frame)
+            vx += ax_w * dt
+            vy += ay_w * dt
+            vz += az_w * dt
+    
+        # 5) leakage and ZUPT (stationary detection) to limit drift
+        leak = self.alpha
+        vx *= leak; vy *= leak; vz *= leak
 
-        # --- Integrate acceleration to velocity ---
-        vx += ax_lin * dt
-        vy += ay_lin * dt
-        vz += az_lin * dt
-
-        if (abs(ax_lin) < self.mps_threshhold and abs(ay_lin) < self.mps_threshhold and abs(az_lin) < self.mps_threshhold):
+        
+        # --- Zero-velocity detection ---
+        if (abs(ax_w) < self.mps_threshhold and abs(ay_w) < self.mps_threshhold and abs(az_w) < self.mps_threshhold):
             vx = vy = vz = 0
+        
+
 
         # Integrate velocity to get position (s = s0 + vt)
         px += vx * dt
         py += vy * dt
         pz += vz * dt
         
-
+        '''
         self.vel = [vx, vy, vz]
         self.pos = [px, py, pz]
     
@@ -254,12 +291,12 @@ class QMI8658:
         print("\nPlace the IMU so that the", axis_name, "axis points UP (+1g).")
         input("Press Enter when ready...")
         time.sleep(2)
-        a_up = sum(self.read_acc_g()[{"x": 0, "y": 1, "z": 2}[axis_name]] for _ in range(100)) / 100
+        a_up = sum(self.read_acc()[{"x": 0, "y": 1, "z": 2}[axis_name]] for _ in range(100)) / 100
 
         print("Now flip it so that the", axis_name, "axis points DOWN (-1g).")
         input("Press Enter when ready...")
         time.sleep(2)
-        a_down = sum(self.read_acc_g()[{"x": 0, "y": 1, "z": 2}[axis_name]] for _ in range(100)) / 100
+        a_down = sum(self.read_acc()[{"x": 0, "y": 1, "z": 2}[axis_name]] for _ in range(100)) / 100
 
         print(f"{axis_name.upper()} +1g: {a_up:.4f}, -1g: {a_down:.4f}")
         return a_up, a_down
@@ -269,7 +306,8 @@ class QMI8658:
         results = {}
         for axis in ("x", "y", "z"):
             a_up, a_down = self.measure_axis(axis)
-            scale = 2.0 / (a_up - a_down)
+            print(a_up,a_down)
+            scale = (a_down - a_up) / 2.0
             bias = (a_up + a_down) / 2.0
             results[axis] = (bias, scale)
             print(f"{axis.upper()} -> bias={bias:.5f}, scale={scale:.5f}")
@@ -279,10 +317,11 @@ class QMI8658:
 
 
     def correct_accel(self, acc):
-        ax_corr = (acc[0] - self.calib["x"][0]) * self.calib["x"][1]
-        ay_corr = (acc[1] - self.calib["y"][0]) * self.calib["y"][1]
-        az_corr = (acc[2] - self.calib["z"][0]) * self.calib["z"][1]
+        ax_corr = (acc[0] - self.calib["x"][0]) / self.calib["x"][1]
+        ay_corr = (acc[1] - self.calib["y"][0]) / self.calib["y"][1]
+        az_corr = (acc[2] - self.calib["z"][0]) / self.calib["z"][1]
         return ax_corr, ay_corr, az_corr
+
 
 
     def calibrate_gyro(self, samples=500, delay=0.002):
@@ -321,8 +360,10 @@ class QMI8658:
         if not self.cal_exists():
             self.calibrate_accel()
             print("\nCalibration complete!")
+            tft.text(font,"Calibration Complete",int(col_max/4),int(row_max/2))
         else:
             self.load_cal()
+            tft.text(font,"Calibration Loaded",int(col_max/4),int(row_max/2))
         print("\nCalibration:!")
         print(self.calib)
 
@@ -332,9 +373,9 @@ class QMI8658:
         try:
             with open(filename, "w") as f:
                 ujson.dump(self.calib, f)
-            print("✅ Cal saved to", filename)
+            print("Cal saved to", filename)
         except Exception as e:
-            print("❌ Error saving Cal:", e)
+            print("Error saving Cal:", e)
             
 
     def load_cal(self):
@@ -342,10 +383,10 @@ class QMI8658:
         try:
             with open(filename, "r") as f:
                 data = ujson.load(f)
-            print("✅ Cal loaded from", filename)
+            print("Cal loaded from", filename)
             self.calib = data
         except Exception as e:
-            print("❌ Error loading Cal:", e)
+            print("Error loading Cal:", e)
             self.calib = None
 
 
@@ -384,6 +425,19 @@ def quat_rotate_vec(v, q):
     rz = qv[0]*ty - qv[1]*tx
     # v' = v + 2 * (rx, ry, rz)
     return (v[0] + 2*rx, v[1] + 2*ry, v[2] + 2*rz)
+
+
+def write_data(filename, data):
+    outstring = ""
+    for x in data:
+        x_str = str(x)
+        outstring += x_str
+        outstring += ','
+    with open(filename, "a") as f:
+        f.write(outstring+"\n")
+        
+        
+
 if __name__ == "__main__":
     
     #init the display
@@ -408,18 +462,19 @@ if __name__ == "__main__":
     tft.text(font,"Keep Stationary!",int(col_max/3),int(row_max/3))
     tft.text(font,"Cal in progress",int(col_max/3),int(row_max/3)*2)
     time.sleep(1)
+    tft.fill(0)
     
-        
     # Example usage
     qmi8658 = QMI8658()
 
     # Configure accelerometer and gyroscope
-    qmi8658.configure_acc(0x20, 0x03)  # 4g, 1000Hz
-    qmi8658.configure_gyro(0x50, 0x03) # 32 dps, 7174.4Hz
+    qmi8658.configure_acc(0x20, 0x03)  # 8g, 1000Hz
+    qmi8658.configure_gyro(0x50, 0x03) # 512 dps, 896.8 Hz
     qmi8658.enable_sensors()
     qmi8658.calibrate()
+    time.sleep(1)
     tft.fill(0)
-    tft.text(font,"Calibration Complete",int(col_max/4),int(row_max/2))
+    
     #print(bin(qmi8658.read_reg(0x0,1)[0]))
     #print(bin(qmi8658.read_reg(0x1,1)[0]))
     #print("1: ",bin(qmi8658.read_reg(QMI8658Register_Ctrl1,1)[0]))
@@ -436,23 +491,51 @@ if __name__ == "__main__":
 
     counter = 0
     qmi8658.init_time()
+    
+    #with open("Data.csv", "w") as f:
+        #pass
 
     while True:
         '''
-        acc_g = qmi8658.read_acc_g()
-        acc_g = qmi8658.correct_accel(acc_g)
+        #gs
+        body_acc = qmi8658.read_acc_g()
+        body_acc = qmi8658.correct_accel(body_acc)
+        body_acc = (body_acc[0], body_acc[1], body_acc[2]+1) #assuming orientation (face down) stays the same add +1 to z
+        mag = round(math.sqrt(body_acc[0]*body_acc[0] + body_acc[1]*body_acc[1] + body_acc[2]*body_acc[2]),2)
+        print (body_acc, mag)
+        time.sleep(1)
+        
+        #mps2
+        body_acc = qmi8658.read_acc()
+        body_acc = qmi8658.correct_accel(body_acc)
+        body_acc_si = [x * ONE_G for x in body_acc]
+        mag_si = round(math.sqrt(body_acc_si[0]*body_acc_si[0] + body_acc_si[1]*body_acc_si[1] + (body_acc_si[2]+ONE_G)*(body_acc_si[2]+ONE_G)),2)
+        body_acc_si = (round(body_acc_si[0],2), round(body_acc_si[1],2), round(body_acc_si[2]+ONE_G,2)) #assuming orientation (face down) stays the same add +1 to z
+        print (body_acc_si, mag_si)
+        time.sleep(1)
+        
+        
+        
         gyro = qmi8658.read_gyro()
+    
         gyro = qmi8658.correct_gyro(gyro)
         acc = [x * ONE_G for x in acc_g]
         print(acc)
         time.sleep(.25)
         '''
+        
         qmi8658.update_motion()
+        acc_b = qmi8658.acc
+        #write_data("Data.csv", acc_b)
+        print(acc_b[0],', ',acc_b[1], ', ',acc_b[2])
+        dt = qmi8658.dt
         vel = qmi8658.vel
         pos = qmi8658.pos
         if (counter % 10) == 0:
-            #print("Velocity:",round(vel[0],3),round(vel[1],3),round(vel[2],3))
-            print("Possition:",round(pos[0],3),round(pos[1],3),round(pos[2],3))
+            #print("Acceleration:",round(acc_b[0],1),round(acc_b[1],1),round(acc_b[2],1))
+            #print("Velocity:",round(vel[0],1),round(vel[1],1),round(vel[2],1))
+            #print("Possition:",round(pos[0],1),round(pos[1],1),round(pos[2],1))
+            #print("TimeStep:", dt)
             tft.fill(0)
             tft.text(font,f'POS X:{round(pos[0],3)}',int(col_max/3),int(row_max/5)*2)
             tft.text(font,f'POS Y:{round(pos[1],3)}',int(col_max/3),int(row_max/5)*3)
@@ -460,5 +543,7 @@ if __name__ == "__main__":
         counter=counter+1
         time.sleep(sample_period)
         
+
+
 
 
